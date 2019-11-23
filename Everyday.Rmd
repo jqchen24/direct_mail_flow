@@ -1,0 +1,816 @@
+---
+title: "Everyday essentials DM"
+subtitle: "An example of DM modeling framework"
+output: html_notebook
+---
+
+For most direct mails in Grainger, our goal is to get existing contacts to buy more of the product categories featured in the direct mail. Therefore, our training population will be those contacts who have purchased the relevant product categories in the past 12 months. We will be predicting their purchasing amount of the same categories in the next X number of months (depending on the size/impact of the marketing piece). The key metrics that we look at during the measurement is return of investment. 
+
+- Note that there is additional analytical work for SKU selection prior to modeling, but that's outside of the scope of this document. Check with Lindsey for more details. 
+
+- After a model is built and scored using the latest data, there is a separate process to design the A/B test (to measure the incremental sales and eventually ROI). This document does not cover this step. Check with Lindsey for more details. 
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+suppressWarnings(suppressWarnings(library(lubridate)))
+suppressWarnings(suppressWarnings(library(tidyr)))
+suppressWarnings(suppressWarnings(library(doParallel)))
+suppressWarnings(suppressWarnings(library(RODBC)))
+suppressWarnings(suppressWarnings(library(caret)))
+suppressWarnings(suppressWarnings(library(dplyr)))
+suppressWarnings(suppressWarnings(library(data.table)))
+suppressWarnings(suppressWarnings(library(ggplot2)))
+suppressWarnings(suppressWarnings(library(caret)))
+suppressWarnings(suppressWarnings(library(xgboost)))
+suppressWarnings(suppressWarnings(library(sjmisc)))
+suppressWarnings(suppressWarnings(library(DMwR)))
+```
+
+
+### Step 1: Define the date range of independent variables and dependent variable
+
+The rule of thumb is to make sure the date range of the dependent variable is the same as the measurement window for the same DM one year ago
+
+- Measurement (prediction) window of this current DM: Sep 2019 - Dec 2019
+- Date range of data available when buiding the model: up to June 2019
+
+- Independent variables - Jul 2017 to Jun 2018 
+- Dependent variables - Sep 16 to Dec 15 2018 (three month measurement window)
+
+
+```{r}
+## Enter in-home date one year ago.
+dep_var_start <- as.Date('9/16/2018', "%m/%d/%Y")
+dep_var_end <- dep_var_start %m+% months(3)
+ind_var_end <- dep_var_start %m-% months(3)
+ind_var_start <- ind_var_end %m-% months(11)
+
+
+
+ind_fiscper_start <- ifelse(month(ind_var_start) < 10, 
+                        paste0(year(ind_var_start), "00", month(ind_var_start)),
+                        paste0(year(ind_var_start), "0", month(ind_var_start)))
+ind_fiscper_end <- ifelse(month(ind_var_end) < 10, 
+                        paste0(year(ind_var_end), "00", month(ind_var_end)),
+                        paste0(year(ind_var_end), "0", month(ind_var_end)))
+dep_fiscper_start <- ifelse(month(dep_var_start) < 10, 
+                        paste0(year(dep_var_start), "00", month(dep_var_start)),
+                        paste0(year(dep_var_start), "0", month(dep_var_start)))
+dep_fiscper_end <- ifelse(month(dep_var_end) < 10, 
+                        paste0(year(dep_var_end), "00", month(dep_var_end)),
+                        paste0(year(dep_var_end), "0", month(dep_var_end)))
+fiscper_start <- ifelse(month(ind_var_start) < 10, 
+                        paste0(year(ind_var_start), "00", month(ind_var_start)),
+                        paste0(year(ind_var_start), "0", month(ind_var_start)))
+fiscper_end <- ifelse(month(dep_var_end) < 10, 
+                        paste0(year(dep_var_end), "00", month(dep_var_end)),
+                        paste0(year(dep_var_end), "0", month(dep_var_end)))
+```
+
+### Step 2: Data Import
+
+Import account/contact/category/month level sales data from Teradata. 
+
+**This step currently is done locally. Edwin has a way to allow the user to pull TD data directly from RStudio on hadoop**
+
+```{r}
+myconn <- odbcConnect("Teradata LDAP")
+contact_sales <- sqlQuery(myconn, paste0("SELECT CAST(SI.SOLD_TO as INT),  SI.ZBPCNTACT, 
+b.seg_name as segment, b.cat_id, SI.fiscper, SUM(SI.SUBTOTAL_2) as sales 
+                  FROM PRD_DWH_VIEW_LMT.CUSTOMER_V c
+                  RIGHT JOIN PRD_DWH_VIEW_LMT.Sales_Invoice_V SI ON c.customer = SI.SOLD_TO
+                  LEFT JOIN  PRD_DWH_VIEW_LMT.PROD_HIER_V b ON SI.prod_hier = b.prod_hier
+                  WHERE SI.ZZCOMFLG = 'Y' AND
+                  SI.COMP_CODE = '0300' AND
+                  SI.ZPOSTSTAT = 'C' AND
+                  SI.FISCPER  BETWEEN ", fiscper_start,   " AND ", fiscper_end , " AND ",
+                  "SI.ACCNT_ASGN IN ('01','20')
+                  GROUP BY 1,2,3,4, 5"))
+
+fwrite(contact_sales, "H:\\ANALYSIS\\PERSONAL FOLDERS\\Chen\\DM\\JanSan_2019\\contact_sales_", fiscper_start, "_", fiscper_end, ".csv")
+odbcClose(myconn)
+
+```
+
+Upload contact_sales.csv along with the project folder to hadoop server and go from there.
+
+Import SKU list. Identify the categories to be featured.
+
+- Check with Lindsey to find out whom you should get the list from.
+
+```{r}
+SKU_list <- fread("SKU_list.csv", data.table = F)
+
+### Get rid of duplicates in SKU list.
+SKU_list <- SKU_list[!duplicated(SKU_list), ]
+
+### another TD query done locally to get category ID if the SKU list doesn't have ### this data
+categories <- sqlQuery(myconn, "SELECT M.MATERIAL, P.CAT_ID FROM PRD_DWH_VIEW_LMT.Material_V M
+LEFT JOIN PRD_DWH_VIEW_LMT.PROD_HIER_V P on M.PROD_HIER = P.PROD_HIER")
+
+## Join SKU list with categories
+SKU_list <- left_join(SKU_list, categories, by = "MATERIAL")
+rm(categories)
+write.csv(SKU_list, "SKU_list.csv", row.names = F)
+
+
+SKU_list <- fread("SKU_list.csv", data.table = F)
+str(SKU_list)
+cats <- SKU_list %>%
+  group_by(cat_id) %>%
+  summarise(SKUs = n()) %>%
+  select(-SKUs)
+str(cats)
+```
+
+Exclude non-relevant categories from contact_sales table.
+
+```{r}
+contact_sales <- fread(paste0("//hadoop//grainger//data_science//Chen//contact_sales_", fiscper_start, "_", fiscper_end, ".csv"), data.table = F)
+contact_sales %>% group_by(cat_id) %>% summarise(SKUs = n()) %>% count()
+contact_sales <- right_join(contact_sales, cats, by = "cat_id") %>%
+  rename(account = `Sold-To Party`,
+         contact_ID = ZBPCNTACT)
+contact_sales %>% group_by(cat_id) %>% summarise(SKUs = n()) %>% count()
+
+```
+
+Import account model file and contact model file for independent variables.
+
+- Need to transfer the model file and contact model file from SPSS server to 101 server beforehand. 
+
+```{r}
+MF <- ifelse(month(ind_var_end) < 10, 
+             paste0(year(ind_var_end), "0", month(ind_var_end), "_",month.abb[month(ind_var_end)], "_merged_model_file.csv"),
+             paste0(year(ind_var_end), month(ind_var_end), "_",month.abb[month(ind_var_end)], "_merged_model_file.csv")
+)
+CF <- ifelse(month(ind_var_end) < 10,
+             paste0(year(ind_var_end), "0", month(ind_var_end), "_",month.abb[month(ind_var_end)], "_contact_model_file.csv"),
+             paste0(year(ind_var_end), month(ind_var_end), "_",month.abb[month(ind_var_end)], "_contact_model_file.csv")
+)
+model_file <- fread(paste0("/hadoop/grainger/data_science/inputFiles/modelFiles/", MF), data.table = F)
+str(model_file)
+contact_file <- fread(paste0("/hadoop/grainger/data_science/inputFiles/modelFiles/", CF), data.table = F)
+str(contact_file)
+
+```
+
+### Step 3: Prepocessing account model file and contact model file
+
+- Converting data types
+- Create new variables
+- rename the variables
+
+```{r}
+which(sapply(model_file, is.character))
+sapply(model_file, class)
+model_file <- model_file %>%
+  mutate(BUS_LOC_ID = as.character(BUS_LOC_ID),
+         mro_decile = as.factor(mro_decile),
+         Customer_Size = as.factor(Customer_Size),
+         Corp_Maj_Flag = as.factor(Corp_Maj_Flag),
+         multisite = as.factor(multisite),
+         indseg1 = as.factor(indseg1),
+         CONTRACT_FLAG = as.factor(CONTRACT_FLAG),
+         coverage = ifelse(substr(CSG, 1, 2) %in% seq(72, 78), "ISA",
+                           ifelse(substr(CSG, 1, 2) %in% c(84, 88), "AM",
+                                  ifelse(substr(CSG, 1, 2) == 83, "FAR", 
+                                         ifelse(substr(CSG, 1, 2) == 89, "Gov ARM",
+                                                       "Uncovered")))),
+         coverage = as.factor(coverage),
+         dunsman = as.factor(dunsman),
+         dunsstat = as.factor(dunsstat),
+         dunssub = as.factor(dunssub),
+         Trans_3M_pre = rowSums(select(., TRANS03:TRANS01)),
+         Trans_6M_pre = rowSums(select(., TRANS06:TRANS01)),
+         Trans_12M_pre = rowSums(select(., TRANS12:TRANS01)),
+         SALES_3M_pre = rowSums(select(., SALES03:SALES01)),
+         SALES_6M_pre = rowSums(select(., SALES06:SALES01)),
+         SALES_12M_pre = rowSums(select(., SALES12:SALES01))
+         ) %>%
+  rename(account = ACCOUNT)%>%
+  select(-realmro)
+
+contact_file <- contact_file %>% 
+  rename_at(vars(-(1:9)), ~ paste0(., '_INDV')) %>%
+  select(c(1:2, 10:ncol(contact_file))) %>%
+  rename(account = ACCOUNT, contact_ID = CONTACT_ID)
+colnames(contact_file)
+```
+
+- Aggregate contact_sales data to account/contact level. 
+- Create the dependent variable sales_post3M.
+- Filter out records without contact_ID.
+
+
+```{r}
+contact_sales_aggr <- contact_sales %>%
+  filter(is.na(contact_ID) == F & account > 800000000) %>%
+  group_by(account, contact_ID) %>%
+  summarise(sales_pre12 = sum(sales[FISCPER >= ind_fiscper_start & 
+                                      FISCPER <= ind_fiscper_end], na.rm = T),
+            sales_post3M = sum(sales[FISCPER >= dep_fiscper_start & 
+                                       FISCPER <= dep_fiscper_end], na.rm = T))
+
+str(contact_sales_aggr)  
+rm(contact_sales)
+```
+
+### Step 4: Join the datasets
+Join contact sales with model file and contact file, filter out inactive accounts.
+
+- Use left join to only keep those R12 buying contacts. 
+
+```{r}
+eligible_contacts <- left_join(contact_sales_aggr, model_file, by = "account") %>%
+  left_join(contact_file, by = c("account", "contact_ID")) %>%
+  filter(SALES12X > 0)
+rm(model_file)
+rm(contact_file)
+class(eligible_contacts)
+eligible_contacts <- ungroup(eligible_contacts)
+```
+
+### Step 5: Feature engineering
+
+Check if there are factor/character variables in the dataset and create dummy variables.
+
+```{r, echo=TRUE}
+which(sapply(eligible_contacts, is.factor))
+which(sapply(eligible_contacts, is.character))
+names(Filter(is.factor, eligible_contacts))
+eligible_contacts <- eligible_contacts %>% 
+  to_dummy(c(Corp_Maj_Flag, mro_decile, indseg1, Customer_Size, 
+             CONTRACT_FLAG, multisite, coverage, dunsstat, dunssub, dunsman), suffix = "label") %>%
+  bind_cols(eligible_contacts) %>%
+  select(account:WLDGN36X_INDV, everything(), -c(mro_decile, indseg1, Corp_Maj_Flag, Customer_Size, CONTRACT_FLAG, multisite, coverage, dunsstat, dunssub, dunsman))
+which(sapply(eligible_contacts, is.factor))
+which(sapply(eligible_contacts, is.character))
+```
+
+
+Create percentage variables and cap them to be between 0 and 1
+
+```{r, echo=TRUE}
+pct_cal <- sapply(names(eligible_contacts)[which(colnames(eligible_contacts) == "ABRVS12X"):which(colnames(eligible_contacts) == "WLDGS12X")], function(x) {
+  eligible_contacts[paste0(x, "_pct")] <<- eligible_contacts[x] / eligible_contacts$SALES12X
+})
+names(eligible_contacts)
+rm(pct_cal)
+lapply(eligible_contacts[, c(699:731)], summary)
+eligible_contacts <- cbind(select(eligible_contacts, account:LSS_INDIC_CD_INDV),
+                  lapply(select(eligible_contacts, ABRVS12X_pct:WLDGS12X_pct), 
+                         function(x){
+  x = ifelse(x > 1, 1, ifelse(x < 0, 0, x))
+}))
+lapply(eligible_contacts[, c(699:731)], summary)
+```
+
+Recode distance.
+Drop empty levels for factor variables.
+```{r}
+sort(colSums(is.na(eligible_contacts)))
+eligible_contacts <- eligible_contacts %>%
+  filter(is.na(LUBRN24X_INDV) == F) %>%
+  mutate(DISTANCE= ifelse(is.na(DISTANCE), mean(DISTANCE, na.rm=TRUE), DISTANCE))
+sort(colSums(is.na(eligible_contacts)))
+is.factor <- sapply(eligible_contacts, is.factor)
+names(eligible_contacts)[is.factor]
+## distribution of factor variables.
+sapply(eligible_contacts[, is.factor], table)
+```
+
+### Step 6: Model building
+
+#### Create training data and validation data.
+```{r}
+set.seed(3)
+eligible_contacts <- eligible_contacts %>% mutate(id = row_number())
+train_data <- sample_frac(eligible_contacts, 0.8)
+train_index <- train_data$id
+vali_data <- eligible_contacts[-train_index, ]
+rm(train_index)
+MySummary  <- function(data, lev = NULL, model = NULL){
+  a1 <- defaultSummary(data, lev, model)
+  b1 <- twoClassSummary(data, lev, model)
+  c1 <- prSummary(data, lev, model)
+  out <- c(a1, b1, c1)
+  out}
+```
+
+#### Variable selection
+
+Build an xgboost model with some initialized hyperparameters using a small sample. The goal is to use variable importance to find out which variables are the most important ones. 
+
+sample_size = 0.1
+  nrounds eta max_depth gamma colsample_bytree min_child_weight subsample     RMSE  Rsquared      MAE   RMSESD
+1     200 0.1         5     0              0.7                1       0.7 2544.795 0.3834951 490.9741 259.7104
+  RsquaredSD    MAESD
+1 0.06160129 11.63287
+R2 on training data: 0.9043041 
+R2 on validation data 0.329251
+
+sample_size = 0.2 (less overfitting)
+  nrounds eta max_depth gamma colsample_bytree min_child_weight subsample     RMSE
+1     200 0.1         5     0              0.7                1       0.7 3121.874
+   Rsquared      MAE   RMSESD RsquaredSD    MAESD
+1 0.3854636 503.7796 739.9429 0.03906512 17.43657
+R2 on training data: 0.8528918 
+R2 on validation data 0.34724
+
+```{r}
+set.seed(3)
+train_sample <- sample_frac(train_data, size = 0.2)
+time_start <- proc.time()
+set.seed(3)
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+xgboost <- train(x = select(train_sample, -c(account, contact_ID, sales_post3M, BUS_LOC_ID, id, LSS_INDIC_CD_INDV)),
+                 y = train_sample$sales_post3M, 
+                 method = "xgbTree",
+                 metric = "RMSE",
+                 trControl = trainControl(method = "cv",
+                                          number = 5),
+                 tuneGrid =  expand.grid(nrounds = 200, #the maximum number of iterations
+                                         eta = 0.1, # shrinkage
+                                         max_depth = 5, # max depth of a tree
+                                         gamma = 0,
+                                         colsample_bytree = 0.7,
+                                         min_child_weight = 1, # Larger values are more robust than smaller values (less likely to result in overfitting).
+                                         subsample = 0.7))
+getTrainPerf(xgboost)
+xgboost$results
+proc.time() - time_start
+stopCluster(cl)
+pred <- predict(xgboost, newdata = train_sample)
+R2 <- 1 - (sum((train_sample$sales_post3M - pred)^2)
+           /sum((train_sample$sales_post3M - mean(train_sample$sales_post3M))^2))
+cat("R2 on training data:", R2, "\n")
+
+score_ventile = ntile(-pred, 20)
+barplot(tapply(train_sample$sales_post3M, score_ventile, mean))
+
+pred <- predict(xgboost, newdata = vali_data)
+R2 <- 1 - (sum((vali_data$sales_post3M - pred)^2)
+           /sum((vali_data$sales_post3M - mean(vali_data$sales_post3M))^2))
+cat("R2 on validation data", R2)
+R2(pred, vali_data$sales_post3M)
+score_ventile = ntile(-pred, 20)
+barplot(tapply(vali_data$sales_post3M, score_ventile, mean))
+```
+
+Select the top N most important variables. 
+
+```{r}
+imp <- data.frame(names = rownames(varImp(xgboost)$importance), varImp(xgboost, scale = F)$importance)
+rownames(imp) <- NULL
+imp[order(imp[, 2], decreasing = T), ]
+vars <- imp[order(imp[, 2], decreasing = T), ]$names[1:40]
+vars <- droplevels(vars)
+# the following line is critical.
+vars <- as.character(vars)
+# names(eligible_contacts[, vars])
+```
+
+#### Build a new xgboost model using top N important variables
+
+- First use all the initialized parameters from the above model, but feed only the top N variables.
+- Adjust N and compare the new model performance with the original model that has all variables. Use this step to select the right N. 
+
+Tuning steps: 
+
+- Set eta = 0.1, initialize all other parameters. 
+- Tune max_depth and min_child_weight.
+- Tune subsample and colsample_bytree
+- Tune gamma
+- Reduce eta and increase nrounds. 
+
+top 40: 
+R2 on training data: 0.8409327
+R2 on validation data 0.3641488
+
+top 30:
+R2 on training data: 0.8389916
+R2 on validation data 0.3600427
+- Note that when top 30 validation performance is worse than top 40, so we should try something between 30 and 40. 
+
+top 35:
+R2 on training data: 0.8415278 
+R2 on validation data 0.3592159
+
+- Conclusion. Pick top 40 variables. 
+
+   nrounds max_depth eta gamma colsample_bytree min_child_weight subsample
+23     200         6 0.1     0              0.7                3       0.7
+R2 on training data: 0.8190443 
+R2 on validation data 0.3511186
+In a different seed, we got much better performance on validation data. This indicates that there is a lot of variance in the results. 
+   nrounds max_depth eta gamma colsample_bytree min_child_weight subsample
+20     200         5 0.1     0              0.7                5       0.7
+
+R2 on training data: 0.7609216 
+R2 on validation data 0.3893498
+
+   nrounds max_depth eta gamma colsample_bytree min_child_weight subsample
+25     200         5 0.1     0                1                5         1
+R2 on training data: 0.7856831 
+R2 on validation data 0.3719201
+
+  nrounds max_depth  eta gamma colsample_bytree min_child_weight subsample
+1    1600         5 0.01     0                1                5         1
+R2 on training data: 0.7539876 
+R2 on validation data 0.3779498
+
+  nrounds max_depth  eta gamma colsample_bytree min_child_weight subsample
+1     800         5 0.01     0                1                5         1
+R2 on training data: 0.7153119 
+R2 on validation data 0.3771401
+
+  nrounds max_depth  eta gamma colsample_bytree min_child_weight subsample
+4     350         5 0.01     0                1                5         1
+R2 on training data: 0.6662359 
+R2 on validation data 0.3904778
+
+```{r, echo=TRUE}
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+time_start <- proc.time()
+set.seed(3)
+xgboost_vars <- train(x = train_sample[, vars],
+                 y = train_sample$sales_post3M, 
+                 method = "xgbTree",
+                 metric = "RMSE",
+                 trControl = trainControl(method = "boot",
+                                          number = 5),
+                 tuneGrid =  expand.grid(nrounds = 350, 
+                                         eta = 0.01, # shrinkage
+                                         max_depth = 5, # max depth of a tree
+                                         gamma = 0,
+                                         colsample_bytree = 1,
+                                         min_child_weight = 5, # Larger values are more robust than smaller values (less likely to result in overfitting).
+                                         subsample = 1))
+getTrainPerf(xgboost_vars)
+xgboost_vars$results
+proc.time() - time_start
+stopCluster(cl)
+pred <- predict(xgboost_vars, newdata = train_sample[, vars])
+R2 <- 1 - (sum((train_sample$sales_post3M - pred)^2)
+           /sum((train_sample$sales_post3M - mean(train_sample$sales_post3M))^2))
+cat("R2 on training data:", R2, "\n")
+
+score_quartile = ntile(-pred, 20)
+barplot(tapply(train_sample$sales_post3M, score_quartile, mean))
+
+pred <- predict(xgboost_vars, newdata = vali_data[, vars])
+R2 <- 1 - (sum((vali_data$sales_post3M - pred)^2)
+           /sum((vali_data$sales_post3M - mean(vali_data$sales_post3M))^2))
+cat("R2 on validation data", R2)
+score_ventile = ntile(-pred, 20)
+barplot(tapply(vali_data$sales_post3M, score_ventile, mean))
+```
+
+
+```{r}
+tuneplot <- function(x, probs = .90) {
+  ggplot(x) +
+    coord_cartesian(ylim = c(quantile(x$results$RMSE, probs = probs), min(x$results$RMSE))) +
+    theme_bw()
+}
+
+tuneplot(xgboost_vars)
+```
+
+Train using the whole training data
+
+```{r, echo=TRUE}
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+time_start <- proc.time()
+set.seed(3)
+xgboost_vars <- train(x = train_data[, vars],
+                 y = train_data$sales_post3M, 
+                 method = "xgbTree",
+                 metric = "RMSE",
+                 trControl = trainControl(method = "boot",
+                                          number = 5),
+                 tuneGrid =  expand.grid(nrounds = 350, #the maximum number of iterations
+                                         eta = 0.01, # shrinkage
+                                         max_depth = 5, # max depth of a tree
+                                         gamma = 0,
+                                         colsample_bytree = 1,
+                                         min_child_weight = 5, # Larger values are more robust than smaller values (less likely to result in overfitting).
+                                         subsample = 1))
+getTrainPerf(xgboost_vars)
+xgboost_vars$results
+proc.time() - time_start
+stopCluster(cl)
+pred <- predict(xgboost_vars, newdata = train_sample[, vars])
+R2 <- 1 - (sum((train_sample$sales_post3M - pred)^2)
+           /sum((train_sample$sales_post3M - mean(train_sample$sales_post3M))^2))
+cat("R2 on training data:", R2, "\n")
+
+score_quartile = ntile(-pred, 20)
+barplot(tapply(train_sample$sales_post3M, score_quartile, mean))
+
+pred <- predict(xgboost_vars, newdata = vali_data[, vars])
+R2 <- 1 - (sum((vali_data$sales_post3M - pred)^2)
+           /sum((vali_data$sales_post3M - mean(vali_data$sales_post3M))^2))
+cat("R2 on validation data", R2)
+score_ventile = ntile(-pred, 20)
+barplot(tapply(vali_data$sales_post3M, score_ventile, mean))
+```
+
+Build a glm model. Much worse than xgboost_vars.
+  TrainRMSE TrainRsquared TrainMAE method
+1  6332.106     0.1560661 579.4348     lm
+R2: 0.6109363
+```{r}
+set.seed(1)
+time_start <- proc.time()
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+lm_model <- train(x = train_sample[, vars],
+                 y = train_sample$sales_post3M, 
+                   method = "lm",
+                   metric = "Rsquared",
+                   trControl = trainControl(method = "boot", 
+                                            number = 5,
+                                            summaryFunction = defaultSummary))
+proc.time() - time_start
+stopCluster(cl)
+getTrainPerf(lm_model)
+pred <- predict(lm_model, newdata = train_data)
+R2 <- 1 - (sum((train_data$sales_post3M - pred)^2)
+           /sum((train_data$sales_post3M - mean(train_data$sales_post3M))^2))
+R2
+score_quartile = ntile(-pred, 20)
+barplot(tapply(train_data$sales_post3M, score_quartile, mean))
+# summary(lm_model$finalModel)
+```
+
+Validate the model.
+R2: -1.286
+```{r}
+pred <- predict(lm_model, newdata = vali_data)
+R2 <- 1 - (sum((vali_data$sales_post3M - pred)^2)
+           /sum((vali_data$sales_post3M - mean(vali_data$sales_post3M))^2))
+R2
+score_quartile = ntile(-pred, 20)
+barplot(tapply(vali_data$sales_post3M, score_quartile, mean))
+```
+
+
+#### Build the final model on full dataset
+```{r}
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+time_start <- proc.time()
+set.seed(6)
+xgboost_full <- train(x = eligible_contacts[, vars],
+                 y = eligible_contacts$sales_post3M, 
+                 method = "xgbTree",
+                 metric = "Rsquared",
+                 trControl = trainControl(method = "none"),
+                 tuneGrid =  expand.grid(nrounds = 350, #the maximum number of iterations
+                                         eta = 0.01, # shrinkage
+                                         max_depth = 5, # max depth of a tree
+                                         gamma = 0,
+                                         colsample_bytree = 1,
+                                         min_child_weight = 5, # Larger values are more robust than smaller values (less likely to result in overfitting).
+                                         subsample = 1))
+stopCluster(cl)
+proc.time() - time_start
+pred <- predict(xgboost_full, newdata = eligible_contacts[, vars])
+R2 <- 1 - (sum((eligible_contacts$sales_post3M - pred)^2)
+           /sum((eligible_contacts$sales_post3M - mean(eligible_contacts$sales_post3M))^2))
+R2
+score_quartile = ntile(-pred, 20)
+barplot(tapply(eligible_contacts$sales_post3M, score_quartile, mean))
+```
+
+
+
+### Step 7: Model scoring
+
+#### Construct scoring dataset
+```{r}
+myconn <- odbcConnect("Teradata LDAP")
+scoring_end <- dep_var_start %m+% months(9)
+scoring_start <- scoring_end %m-% months(11)
+scoring_start_month <- ifelse(month(scoring_start) < 10, 
+                        paste0(year(scoring_start), "00", month(scoring_start)),
+                        paste0(year(scoring_start), "0", month(scoring_start)))
+
+scoring_end_month <- ifelse(month(scoring_end) < 10, 
+                        paste0(year(scoring_end), "00", month(scoring_end)),
+                        paste0(year(scoring_end), "0", month(scoring_end)))
+
+contact_sales <- sqlQuery(myconn, paste0("SELECT CAST(SI.SOLD_TO as INT),  SI.ZBPCNTACT, 
+b.seg_name as segment, b.cat_id, SI.fiscper, SUM(SI.SUBTOTAL_2) as sales 
+                  FROM PRD_DWH_VIEW_LMT.CUSTOMER_V c
+                  RIGHT JOIN PRD_DWH_VIEW_LMT.Sales_Invoice_V SI ON c.customer = SI.SOLD_TO
+                  LEFT JOIN  PRD_DWH_VIEW_LMT.PROD_HIER_V b ON SI.prod_hier = b.prod_hier
+                  WHERE SI.ZZCOMFLG = 'Y' AND
+                  SI.COMP_CODE = '0300' AND
+                  SI.ZPOSTSTAT = 'C' AND
+                  SI.FISCPER  BETWEEN ", scoring_start_month, " AND ",
+                  scoring_end_month,  "AND
+                  SI.ACCNT_ASGN IN ('01','20')
+                  GROUP BY 1,2,3,4, 5"))
+
+fwrite(contact_sales, paste0("contact_sales_scoring_", scoring_start_month, "_", scoring_end_month, ".csv"))
+```
+
+Load contact_sales_scoring.csv to hadoop server and then go from there. 
+
+Import SKU list and dentify the categories to be targeted.
+```{r}
+SKU_list <- fread("SKU_list.csv", data.table = F)
+str(SKU_list)
+cats <- SKU_list %>%
+  group_by(cat_id) %>%
+  summarise(SKUs = n()) %>%
+  select(-SKUs)
+str(cats)
+```
+
+Filter out non-relevant categories from contact_sales table.
+```{r}
+contact_sales_scoring <- fread(paste0("/hadoop/grainger/data_science/Chen/contact_sales_scoring_", scoring_start_month, "_", scoring_end_month, ".csv"), data.table = F)
+contact_sales_scoring %>% group_by(cat_id) %>% summarise(SKUs = n()) %>% count()
+contact_sales_scoring <- right_join(contact_sales_scoring, cats, by = "cat_id") %>%
+  rename(account = `Sold-To Party`,
+         contact_ID = ZBPCNTACT)
+contact_sales_scoring %>% group_by(cat_id) %>% summarise(SKUs = n()) %>% count()
+contact_sales_scoring %>% group_by(segment)
+```
+
+- Aggregate contact_sales data to account/contact level. 
+- Filter out records without contact_ID.
+
+
+```{r}
+contact_sales_aggr_scoring <- contact_sales_scoring %>%
+  filter(is.na(contact_ID) == F & account > 800000000) %>%
+  group_by(account, contact_ID) %>%
+  summarise(sales_pre12 = sum(sales, na.rm = T))
+str(contact_sales_aggr_scoring)  
+rm(contact_sales_scoring)
+```
+
+
+```{r}
+model_file_scoring <- fread("/hadoop/grainger/data_science/inputFiles/modelFiles/201908_Aug_merged_model_file.csv", data.table = F)
+contact_file_scoring <- fread("/hadoop/grainger/data_science/inputFiles/modelFiles/201908_Aug_contact_model_file.csv", data.table = F)
+which(sapply(model_file_scoring, is.character))
+which(sapply(model_file_scoring, is.numeric))
+sapply(model_file_scoring, class)
+model_file_scoring <- model_file_scoring %>%
+  mutate(BUS_LOC_ID = as.character(BUS_LOC_ID),
+         mro_decile = as.factor(mro_decile),
+         Customer_Size = as.factor(Customer_Size),
+         Corp_Maj_Flag = as.factor(Corp_Maj_Flag),
+         multisite = as.factor(multisite),
+         indseg1 = as.factor(indseg1),
+         CONTRACT_FLAG = as.factor(CONTRACT_FLAG),
+         coverage = CSG %/% 10000,
+         SALES_3M_pre = rowSums(select(., SALES03:SALES01)),
+         SALES_6M_pre = rowSums(select(., SALES06:SALES01)),
+         SALES_12M_pre = rowSums(select(., SALES12:SALES01))
+         ) %>%
+  rename(account = ACCOUNT)
+
+contact_file_scoring <- contact_file_scoring %>% 
+  rename_at(vars(-(1:9)), ~ paste0(., '_INDV')) %>%
+  select(c(1:2, 10:ncol(contact_file_scoring))) %>%
+  rename(account = ACCOUNT, contact_ID = CONTACT_ID)
+colnames(contact_file_scoring)
+
+### This join filters out those contacts that don't have R12 sales for the featured L3 categories. 
+scoring <- left_join(contact_sales_aggr_scoring, model_file_scoring, by = "account") %>%
+  left_join(contact_file_scoring, by = c("account", "contact_ID")) %>%
+  filter(SALES12X > 0)
+
+rm(contact_file_scoring)
+rm(model_file_scoring)
+rm(contact_sales_aggr_scoring)
+scoring <- ungroup(scoring)
+
+scoring <- scoring %>%
+  to_dummy(c(Corp_Maj_Flag, mro_decile, indseg1, Customer_Size, CONTRACT_FLAG, multisite), suffix = "label") %>%
+  bind_cols(scoring) %>%
+  select(contact_ID:WLDGN36X_INDV, everything(), -c(mro_decile, indseg1, Corp_Maj_Flag, Customer_Size, CONTRACT_FLAG, multisite))
+
+pct_cal <- sapply(names(scoring)[which(colnames(scoring) == "ABRVS12X"):which(colnames(scoring) == "WLDGS12X")], function(x) {
+  scoring[paste0(x, "_pct")] <<- scoring[x] / scoring$SALES12X
+})
+names(scoring)
+rm(pct_cal)
+
+str(scoring)
+sort(colSums(is.na(scoring)))
+scoring <- scoring %>%
+  filter(is.na(LUBRN24X_INDV) == F) %>%
+  mutate(DISTANCE= ifelse(is.na(DISTANCE), mean(DISTANCE, na.rm=TRUE), DISTANCE))
+sort(colSums(is.na(scoring)))
+which(sapply(scoring, is.factor))
+which(sapply(scoring, is.character))
+
+## make sure the variable names are the same as those in the model.
+scoring <- scoring %>%
+  rename(PHONE24X = PHONE_S24X, 
+         WCAL_S24 = WCAL_S24X,
+         CNTR_T24 = CNTR_T24X)
+scoring <- scoring %>%
+  mutate(score = predict(xgboost_full, newdata = scoring[, vars]))
+fwrite(select(scoring, c(account, contact_ID, sales_pre12, score)), file = "scores.csv")
+```
+
+
+#################################################################################
+
+#### Smart send only (check with Scott Albrecht for more details)
+```{r}
+SKU_sales <- sqlQuery(myconn, paste0("SELECT SI.SOLD_TO, SI.ZBPCNTACT, 
+SI.MATERIAL, SI.FISCPER, 
+SUM(SI.SUBTOTAL_2) SALES , COUNT(DISTINCT BILL_NUM) as trans
+FROM PRD_DWH_VIEW_LMT.Sales_Invoice_V SI
+WHERE SI.ZZCOMFLG = 'Y' AND
+SI.COMP_CODE = '0300' AND
+SI.ZPOSTSTAT = 'C' AND
+SI.FISCPER  BETWEEN  2016005  AND  2019004 AND
+SI.BPARTNER NOT IN('0111111118','0222222226','0244444444') AND
+SI.ACCNT_ASGN IN ('01','20')
+GROUP BY  SI.SOLD_TO, SI.ZBPCNTACT, SI.MATERIAL, SI.FISCPER"))
+```
+
+```{r}
+## Note that need to trim the spaces from material field. 
+SKU_sales <- fread("/hadoop/grainger/data_science/Chen/SKU_sales.csv", data.table = F)
+SKU_sales <- SKU_sales %>%
+  mutate(MATERIAL = as.character(MATERIAL),
+         MATERIAL = trimws(MATERIAL, which = c("both")))
+SKU_list <- fread("SKU_list.csv", data.table = F)
+SKU_list$SALES <- NULL
+
+### Filter to featured SKUs
+featured_SKU_sales <- inner_join(SKU_sales, SKU_list, by = "MATERIAL") %>%
+  select(SOLD_TO, ZBPCNTACT, MATERIAL, FISCPER:trans)
+rm(SKU_sales)
+```
+
+#### Reshape the data
+```{r}
+sales <- featured_SKU_sales %>%
+  select(-trans) %>%
+  spread(FISCPER, SALES)
+
+sales <- sales %>%
+  rename_at(vars(4:ncol(sales)), ~ paste0("sales_", .))
+
+Trans <- featured_SKU_sales %>% 
+  select(-SALES) %>%
+  spread(FISCPER, trans)
+
+Trans <- Trans %>%
+  rename_at(vars(4:ncol(Trans)), ~ paste0("trans_", .))
+
+featured_SKU_sales_reshaped <- full_join(sales, Trans) %>%
+  replace(is.na(.), 0)
+
+sort(colSums(is.na(featured_SKU_sales_reshaped)))
+
+fwrite(featured_SKU_sales_reshaped, "featured_SKU_sales.csv")
+
+```
+
+#### aggregate data to account/contact level
+
+- note that ungroup is needed before mutation. otherwise a weird error will be thrown out.
+
+- note the month variables need to be customized.
+```{r}
+featured_SKU_sales_reshaped <- fread("featured_SKU_sales.csv", data.table = F)
+aggr <- featured_SKU_sales_reshaped %>%
+  group_by(SOLD_TO, ZBPCNTACT) %>%
+  summarise_at(vars(sales_2016005:trans_2019004), sum, na.rm = T) %>%
+  ungroup() %>%
+  mutate(sales_12x = rowSums(select(., sales_2018005:sales_2019004)), 
+         trans_12x = rowSums(select(., trans_2018005:trans_2019004)))
+str(aggr)
+```
+
+#### Merge the dataset with scoring data.
+
+- Note that ~183 contacts have monthly sales and trans variables that are missing because while scoring dataset have all the contacts that have bought featured L3 categories in the last 12 months, aggr table only has contacts who have purchased featured SKUs in the last 36 months. 
+```{r}
+smart_send <- left_join(scoring, aggr, by = c("account" = "SOLD_TO", "contact_ID" = "ZBPCNTACT")) %>%
+  mutate(rank = dense_rank(-score)) %>%
+  select(account, contact_ID, score, rank, sales_2016005:trans_2019004, sales_12x, trans_12x)
+sort(colSums(is.na(smart_send)))
+smart_send <- smart_send %>%
+  replace(is.na(.), 0)
+
+fwrite(smart_send, "smart_send_JanSan.csv")
+
+```
+
